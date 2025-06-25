@@ -10,6 +10,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
+# Try to import TrustCall, fallback to structured output if not available
+try:
+    from trustcall import create_extractor
+    TRUSTCALL_AVAILABLE = True
+except ImportError:
+    TRUSTCALL_AVAILABLE = False
+
 
 def _add_new(left: list, right: list) -> list:
     """Extend left list with new items from right list."""
@@ -22,8 +29,8 @@ class State(MessagesState):
 
 class ToolSelectionResponse(BaseModel):
     """Structured response for tool selection."""
-    selected_tools: List[str] = Field(
-        description="List of tool names selected for the task"
+    tool_ids: List[str] = Field(
+        description="List of tool IDs selected for the task"
     )
     reasoning: str = Field(
         description="Brief explanation of why these tools were selected"
@@ -66,6 +73,35 @@ def create_agent(
         
         return "\n".join(manifest_lines)
 
+    if TRUSTCALL_AVAILABLE:
+        # Use TrustCall for robust structured output
+        tool_selector_extractor = create_extractor(
+            selector_llm,
+            tools=[ToolSelectionResponse],
+            tool_choice="ToolSelectionResponse"
+        )
+        
+        def _invoke_tool_selector(system_prompt: str) -> ToolSelectionResponse:
+            result = tool_selector_extractor.invoke({
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": f"Select the most relevant tools for this query:\n{system_prompt}"
+                    }
+                ]
+            })
+            return result["responses"][0]
+    else:
+        # Fallback to standard structured output
+        selector_with_structured_output = selector_llm.with_structured_output(
+            ToolSelectionResponse
+        )
+        
+        def _invoke_tool_selector(system_prompt: str) -> ToolSelectionResponse:
+            return selector_with_structured_output.invoke([
+                SystemMessage(content=system_prompt)
+            ])
+
     def tool_selector(state: State, config: RunnableConfig) -> State:
         """Select relevant tools based on the user's query."""
         messages = state["messages"]
@@ -81,29 +117,19 @@ Instructions:
 1. Analyze the user's query carefully
 2. Select 3-10 of the most relevant tools that could help answer the query
 3. Provide the tool IDs (not names) in your response
-4. Explain your reasoning briefly
-
-Return your response as a JSON object with the following structure:
-{{
-    "selected_tools": ["tool_id_1", "tool_id_2", ...],
-    "reasoning": "Brief explanation of why these tools were selected"
-}}
+4. If no tools are relevant to the query, return an empty list
+5. Explain your reasoning briefly
 
 User Query: {user_query}"""
 
-        selector_with_structured_output = selector_llm.with_structured_output(
-            ToolSelectionResponse
-        )
+        tool_selection = _invoke_tool_selector(system_prompt)
         
-        response = selector_with_structured_output.invoke([
-            SystemMessage(content=system_prompt)
-        ])
-        
+        # CRITICAL FIX: Append to messages instead of replacing
         return {
-            "selected_tool_ids": response.selected_tools,
+            "selected_tool_ids": tool_selection.tool_ids,
             "messages": [
-                HumanMessage(
-                    content=f"Selected tools: {response.selected_tools}. Reasoning: {response.reasoning}"
+                AIMessage(
+                    content=f"Selected tools: {tool_selection.tool_ids}. Reasoning: {tool_selection.reasoning}"
                 )
             ]
         }
@@ -123,29 +149,30 @@ Instructions:
 1. Analyze the user's query carefully
 2. Select 3-10 of the most relevant tools that could help answer the query
 3. Provide the tool IDs (not names) in your response
-4. Explain your reasoning briefly
-
-Return your response as a JSON object with the following structure:
-{{
-    "selected_tools": ["tool_id_1", "tool_id_2", ...],
-    "reasoning": "Brief explanation of why these tools were selected"
-}}
+4. If no tools are relevant to the query, return an empty list
+5. Explain your reasoning briefly
 
 User Query: {user_query}"""
 
-        selector_with_structured_output = selector_llm.with_structured_output(
-            ToolSelectionResponse
-        )
+        if TRUSTCALL_AVAILABLE:
+            # TrustCall doesn't have async invoke yet, so we use sync for now
+            # This can be updated when async support is available
+            tool_selection = _invoke_tool_selector(system_prompt)
+        else:
+            # Use async structured output
+            selector_with_structured_output = selector_llm.with_structured_output(
+                ToolSelectionResponse
+            )
+            tool_selection = await selector_with_structured_output.ainvoke([
+                SystemMessage(content=system_prompt)
+            ])
         
-        response = await selector_with_structured_output.ainvoke([
-            SystemMessage(content=system_prompt)
-        ])
-        
+        # CRITICAL FIX: Append to messages instead of replacing
         return {
-            "selected_tool_ids": response.selected_tools,
+            "selected_tool_ids": tool_selection.tool_ids,
             "messages": [
-                HumanMessage(
-                    content=f"Selected tools: {response.selected_tools}. Reasoning: {response.reasoning}"
+                AIMessage(
+                    content=f"Selected tools: {tool_selection.tool_ids}. Reasoning: {tool_selection.reasoning}"
                 )
             ]
         }
@@ -166,20 +193,8 @@ User Query: {user_query}"""
         
         llm_with_tools = main_llm.bind_tools(selected_tools)
         
-        # Get the original user query (first message)
-        original_query = None
-        for msg in state["messages"]:
-            if isinstance(msg, HumanMessage) and not msg.content.startswith("Selected tools:"):
-                original_query = msg.content
-                break
-        
-        if original_query:
-            # Create a fresh conversation with the original query
-            conversation = [HumanMessage(content=original_query)]
-        else:
-            conversation = state["messages"]
-        
-        response = llm_with_tools.invoke(conversation)
+        # CRITICAL FIX: Use entire conversation history instead of string matching
+        response = llm_with_tools.invoke(state["messages"])
         return {"messages": [response]}
 
     async def amain_agent(state: State, config: RunnableConfig) -> State:
@@ -198,20 +213,8 @@ User Query: {user_query}"""
         
         llm_with_tools = main_llm.bind_tools(selected_tools)
         
-        # Get the original user query (first message)
-        original_query = None
-        for msg in state["messages"]:
-            if isinstance(msg, HumanMessage) and not msg.content.startswith("Selected tools:"):
-                original_query = msg.content
-                break
-        
-        if original_query:
-            # Create a fresh conversation with the original query
-            conversation = [HumanMessage(content=original_query)]
-        else:
-            conversation = state["messages"]
-        
-        response = await llm_with_tools.ainvoke(conversation)
+        # CRITICAL FIX: Use entire conversation history instead of string matching
+        response = await llm_with_tools.ainvoke(state["messages"])
         return {"messages": [response]}
 
     # Create tool node with all tools for execution

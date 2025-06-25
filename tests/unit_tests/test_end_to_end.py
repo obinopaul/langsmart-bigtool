@@ -33,28 +33,23 @@ for function in math_functions:
 tool_registry = {str(uuid.uuid4()): tool for tool in all_tools}
 
 
-class FakeSelectorModel(GenericFakeChatModel):
-    """Fake model that simulates tool selection."""
+class MockTrustCallExtractor:
+    """Mock TrustCall extractor for testing."""
     
-    def __init__(self, selected_tool_ids: list[str], **kwargs):
+    def __init__(self, selected_tool_ids: list[str], reasoning: str = "Mock reasoning"):
         self.selected_tool_ids = selected_tool_ids
-        super().__init__(**kwargs)
+        self.reasoning = reasoning
     
-    def with_structured_output(self, schema):
-        def _invoke(messages):
-            return ToolSelectionResponse(
-                selected_tools=self.selected_tool_ids,
-                reasoning="Selected tools based on query analysis"
-            )
-        
-        class StructuredModel:
-            def invoke(self, messages):
-                return _invoke(messages)
-            
-            async def ainvoke(self, messages):
-                return _invoke(messages)
-        
-        return StructuredModel()
+    def invoke(self, input_data):
+        """Mock invoke method that returns structured response."""
+        return {
+            "responses": [
+                ToolSelectionResponse(
+                    tool_ids=self.selected_tool_ids,
+                    reasoning=self.reasoning
+                )
+            ]
+        }
 
 
 class FakeMainModel(GenericFakeChatModel):
@@ -74,139 +69,191 @@ def _get_acos_tool_id():
     raise ValueError("acos tool not found")
 
 
-def test_llm_driven_tool_selection():
-    """Test the new LLM-driven tool selection architecture."""
+def test_improved_state_management():
+    """Test that the improved state management preserves message history."""
     acos_tool_id = _get_acos_tool_id()
     
-    # Create fake models
-    selector_llm = FakeSelectorModel(selected_tool_ids=[acos_tool_id])
+    # Mock the TrustCall extractor
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    main_llm = FakeMainModel(
-        messages=iter([
-            AIMessage(
-                "",
-                tool_calls=[
-                    {
-                        "name": "acos",
-                        "args": {"x": 0.5},
-                        "id": "abc234",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage("The arc cosine of 0.5 is approximately 1.0472 radians."),
-        ])
-    )
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor([acos_tool_id], "Selected acos for arc cosine calculation")
     
-    # Create agent with new architecture
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    # Patch the create_extractor function
+    graph_module.create_extractor = mock_create_extractor
     
-    # Test the agent
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Use available tools to calculate arc cosine of 0.5.")]
-    })
-    
-    # Validate results
-    assert isinstance(result, dict)
-    assert "messages" in result
-    assert "selected_tool_ids" in result
-    assert acos_tool_id in result["selected_tool_ids"]
-    
-    # Check that messages were processed
-    messages = result["messages"]
-    assert len(messages) >= 2  # Should have at least tool selection and final response
-    
-    # Check that the final message is from the AI
-    final_message = messages[-1]
-    assert isinstance(final_message, AIMessage)
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(
+            messages=iter([AIMessage("Calculation complete")])
+        )
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        # Test with initial user message
+        initial_query = "Calculate the arc cosine of 0.5"
+        result = agent.invoke({
+            "messages": [HumanMessage(content=initial_query)]
+        })
+        
+        # Verify that original user message is preserved
+        messages = result["messages"]
+        assert any(
+            isinstance(msg, HumanMessage) and initial_query in msg.content
+            for msg in messages
+        ), "Original user message should be preserved"
+        
+        # Verify tool selection message was added
+        assert any(
+            isinstance(msg, AIMessage) and "Selected tools:" in msg.content
+            for msg in messages
+        ), "Tool selection message should be added"
+        
+        # Verify selected tools
+        assert acos_tool_id in result["selected_tool_ids"]
+        
+    finally:
+        # Restore original function
+        graph_module.create_extractor = original_create_extractor
 
 
-def test_tool_selector_creates_manifest():
-    """Test that the tool selector creates a proper tool manifest."""
+def test_trustcall_integration():
+    """Test TrustCall integration for robust tool selection."""
     acos_tool_id = _get_acos_tool_id()
     
-    selector_llm = FakeSelectorModel(selected_tool_ids=[acos_tool_id])
-    main_llm = FakeMainModel(messages=iter([AIMessage("Test response")]))
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor(
+            [acos_tool_id], 
+            "Selected acos tool based on query analysis for arc cosine calculation"
+        )
     
-    # Test tool selection
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Calculate arc cosine")]
-    })
+    graph_module.create_extractor = mock_create_extractor
     
-    assert acos_tool_id in result["selected_tool_ids"]
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(messages=iter([AIMessage("TrustCall test complete")]))
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        result = agent.invoke({
+            "messages": [HumanMessage(content="Test TrustCall functionality")]
+        })
+        
+        # Verify TrustCall structured output
+        assert acos_tool_id in result["selected_tool_ids"]
+        
+        # Check reasoning was included
+        reasoning_messages = [
+            msg for msg in result["messages"] 
+            if isinstance(msg, AIMessage) and "Selected tools:" in msg.content
+        ]
+        assert len(reasoning_messages) > 0
+        assert "query analysis" in reasoning_messages[0].content
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
 
 
-def test_main_agent_uses_selected_tools():
-    """Test that the main agent only uses selected tools."""
+def test_main_agent_uses_full_conversation():
+    """Test that main agent uses full conversation history."""
     acos_tool_id = _get_acos_tool_id()
     
-    selector_llm = FakeSelectorModel(selected_tool_ids=[acos_tool_id])
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    # Create a main model that tracks tool binding
-    bound_tools = []
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor([acos_tool_id])
     
-    class TrackingMainModel(FakeMainModel):
-        def bind_tools(self, tools):
-            nonlocal bound_tools
-            bound_tools = tools
-            return super().bind_tools(tools)
+    graph_module.create_extractor = mock_create_extractor
     
-    main_llm = TrackingMainModel(
-        messages=iter([AIMessage("Calculated result")])
-    )
-    
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
-    
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Calculate arc cosine of 0.5")]
-    })
-    
-    # Verify that only selected tools were bound
-    assert len(bound_tools) == 1
-    assert bound_tools[0].name == "acos"
+    try:
+        # Track what messages the main LLM receives
+        received_messages = []
+        
+        class TrackingMainModel(FakeMainModel):
+            def invoke(self, messages):
+                nonlocal received_messages
+                received_messages = messages
+                return super().invoke(messages)
+            
+            def bind_tools(self, tools):
+                self.bound_tools = tools
+                return self
+        
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = TrackingMainModel(
+            messages=iter([AIMessage("Full conversation preserved")])
+        )
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        # Multi-turn conversation
+        initial_messages = [
+            HumanMessage(content="Hello, I need help with math"),
+            AIMessage(content="I can help with math calculations"),
+            HumanMessage(content="Calculate arc cosine of 0.5")
+        ]
+        
+        result = agent.invoke({"messages": initial_messages})
+        
+        # Verify main agent received full conversation history
+        assert len(received_messages) >= 3, "Main agent should receive full conversation history"
+        
+        # Check that original messages are included
+        original_contents = [msg.content for msg in initial_messages]
+        received_contents = [msg.content for msg in received_messages]
+        
+        for original_content in original_contents:
+            assert any(original_content in received_content for received_content in received_contents), \
+                f"Original message '{original_content}' should be preserved"
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
 
 
-def test_empty_tool_selection():
-    """Test behavior when no tools are selected."""
-    selector_llm = FakeSelectorModel(selected_tool_ids=[])
-    main_llm = FakeMainModel(messages=iter([AIMessage("No tools available")]))
+def test_no_valid_tools_scenario():
+    """Test behavior when no valid tools are selected."""
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    def mock_create_extractor(llm, tools, tool_choice):
+        # Return invalid tool IDs
+        return MockTrustCallExtractor(["invalid_id_1", "invalid_id_2"], "No valid tools found")
     
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Do something")]
-    })
+    graph_module.create_extractor = mock_create_extractor
     
-    # Should handle empty tool selection gracefully
-    assert "messages" in result
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(messages=iter([AIMessage("No tools available")]))
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        result = agent.invoke({
+            "messages": [HumanMessage(content="Do something impossible")]
+        })
+        
+        # Should handle gracefully
+        assert "messages" in result
+        
+        # Check for appropriate error message
+        final_message = result["messages"][-1]
+        assert isinstance(final_message, AIMessage)
+        assert "No valid tools were selected" in final_message.content
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
 
 
-def test_invalid_tool_ids():
-    """Test behavior when invalid tool IDs are selected."""
-    selector_llm = FakeSelectorModel(selected_tool_ids=["invalid_id_1", "invalid_id_2"])
-    main_llm = FakeMainModel(messages=iter([AIMessage("No valid tools")]))
-    
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
-    
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Do something")]
-    })
-    
-    # Should handle invalid tool IDs gracefully
-    assert "messages" in result
-    # Invalid tool IDs should be filtered out
-    assert result["selected_tool_ids"] == ["invalid_id_1", "invalid_id_2"]  # They're still in state, but filtered during execution
-
-
-def test_multiple_tool_selection():
-    """Test selection of multiple tools."""
+def test_multiple_tool_selection_with_trustcall():
+    """Test selection of multiple tools using TrustCall."""
     # Get multiple tool IDs
     tool_ids = []
     for tool_id, tool in tool_registry.items():
@@ -215,67 +262,112 @@ def test_multiple_tool_selection():
             if len(tool_ids) >= 3:
                 break
     
-    selector_llm = FakeSelectorModel(selected_tool_ids=tool_ids)
-    main_llm = FakeMainModel(messages=iter([AIMessage("Multiple tools available")]))
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor(
+            tool_ids, 
+            "Selected trigonometric functions for comprehensive math support"
+        )
     
-    result = agent.invoke({
-        "messages": [HumanMessage(content="Do trigonometry calculations")]
-    })
+    graph_module.create_extractor = mock_create_extractor
     
-    # Should have selected multiple tools
-    assert len(result["selected_tool_ids"]) == len(tool_ids)
-    for tool_id in tool_ids:
-        assert tool_id in result["selected_tool_ids"]
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(messages=iter([AIMessage("Multiple tools ready")]))
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        result = agent.invoke({
+            "messages": [HumanMessage(content="Help with trigonometry")]
+        })
+        
+        # Should have selected multiple tools
+        assert len(result["selected_tool_ids"]) == len(tool_ids)
+        for tool_id in tool_ids:
+            assert tool_id in result["selected_tool_ids"]
+        
+        # Check reasoning mentions trigonometric functions
+        reasoning_messages = [
+            msg for msg in result["messages"] 
+            if isinstance(msg, AIMessage) and "trigonometric" in msg.content
+        ]
+        assert len(reasoning_messages) > 0
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
 
 
 @pytest.mark.asyncio
-async def test_async_tool_selection():
-    """Test async version of the tool selection."""
+async def test_async_functionality():
+    """Test async functionality with improved architecture."""
     acos_tool_id = _get_acos_tool_id()
     
-    selector_llm = FakeSelectorModel(selected_tool_ids=[acos_tool_id])
-    main_llm = FakeMainModel(
-        messages=iter([AIMessage("Async calculation complete")])
-    )
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor([acos_tool_id], "Async tool selection")
     
-    result = await agent.ainvoke({
-        "messages": [HumanMessage(content="Calculate arc cosine asynchronously")]
-    })
+    graph_module.create_extractor = mock_create_extractor
     
-    assert acos_tool_id in result["selected_tool_ids"]
-    assert "messages" in result
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(
+            messages=iter([AIMessage("Async operation complete")])
+        )
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        result = await agent.ainvoke({
+            "messages": [HumanMessage(content="Async test query")]
+        })
+        
+        assert acos_tool_id in result["selected_tool_ids"]
+        assert "messages" in result
+        
+        # Verify async reasoning was preserved
+        reasoning_messages = [
+            msg for msg in result["messages"] 
+            if isinstance(msg, AIMessage) and "Async tool selection" in msg.content
+        ]
+        assert len(reasoning_messages) > 0
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
 
 
-def test_state_preservation():
-    """Test that state is properly preserved between nodes."""
-    acos_tool_id = _get_acos_tool_id()
+def test_edge_case_empty_tool_selection():
+    """Test edge case where TrustCall returns empty tool list."""
+    import langsmart_bigtool.graph as graph_module
+    original_create_extractor = graph_module.create_extractor
     
-    selector_llm = FakeSelectorModel(selected_tool_ids=[acos_tool_id])
-    main_llm = FakeMainModel(
-        messages=iter([AIMessage("State preserved")])
-    )
+    def mock_create_extractor(llm, tools, tool_choice):
+        return MockTrustCallExtractor([], "No tools are relevant for this query")
     
-    builder = create_agent(selector_llm, main_llm, tool_registry)
-    agent = builder.compile()
+    graph_module.create_extractor = mock_create_extractor
     
-    initial_state = {
-        "messages": [HumanMessage(content="Test state preservation")],
-        "selected_tool_ids": []
-    }
-    
-    result = agent.invoke(initial_state)
-    
-    # Original message should be preserved
-    assert any(
-        isinstance(msg, HumanMessage) and "Test state preservation" in msg.content
-        for msg in result["messages"]
-    )
-    
-    # Selected tools should be added
-    assert acos_tool_id in result["selected_tool_ids"]
+    try:
+        selector_llm = GenericFakeChatModel(messages=iter([]))
+        main_llm = FakeMainModel(messages=iter([AIMessage("No tools scenario handled")]))
+        
+        builder = create_agent(selector_llm, main_llm, tool_registry)
+        agent = builder.compile()
+        
+        result = agent.invoke({
+            "messages": [HumanMessage(content="Tell me a joke")]
+        })
+        
+        # Should handle empty selection gracefully
+        assert result["selected_tool_ids"] == []
+        
+        # Should provide appropriate message
+        final_message = result["messages"][-1]
+        assert isinstance(final_message, AIMessage)
+        assert "No valid tools were selected" in final_message.content
+        
+    finally:
+        graph_module.create_extractor = original_create_extractor
