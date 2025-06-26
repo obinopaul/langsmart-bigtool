@@ -1,5 +1,6 @@
-from typing import Annotated, Callable, List
+from typing import Annotated, Callable, List, Tuple
 import json
+import asyncio
 
 from langchain_core.language_models import LanguageModelLike
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -41,6 +42,7 @@ def create_agent(
     selector_llm: LanguageModelLike,
     main_llm: LanguageModelLike,
     tool_registry: dict[str, BaseTool | Callable],
+    tool_selection_limit: int = 10,
 ) -> StateGraph:
     """Create an agent with LLM-driven tool selection.
 
@@ -52,6 +54,7 @@ def create_agent(
         selector_llm: Fast language model for tool selection.
         main_llm: Language model for the main agent execution.
         tool_registry: Dict mapping string IDs to tools or callables.
+        tool_selection_limit: The maximum number of tools to select.
     """
     
     def _create_tool_manifest(tool_registry: dict[str, BaseTool | Callable]) -> str:
@@ -73,111 +76,85 @@ def create_agent(
         
         return "\n".join(manifest_lines)
 
+    def _get_selection_prompt(user_query: str, tool_manifest: str) -> str:
+        """Generate the system prompt for the tool selector."""
+        return f"""You are a tool selection expert. Your task is to analyze a user's query and select the most relevant tools from the available tool registry.
+
+{tool_manifest}
+
+Instructions:
+1. Analyze the user's query carefully.
+2. Select 1-{tool_selection_limit} of the most relevant tools that could help answer the query.
+3. Provide the tool IDs (not names) in your response.
+4. If no tools are relevant to the query, return an empty list.
+5. Explain your reasoning briefly.
+
+User Query: {user_query}"""
+
     if TRUSTCALL_AVAILABLE:
-        # Use TrustCall for robust structured output
         tool_selector_extractor = create_extractor(
             selector_llm,
             tools=[ToolSelectionResponse],
             tool_choice="ToolSelectionResponse"
         )
         
-        def _invoke_tool_selector(system_prompt: str) -> ToolSelectionResponse:
+        def _invoke_tool_selector(prompt: str) -> ToolSelectionResponse:
             result = tool_selector_extractor.invoke({
-                "messages": [
-                    {
-                        "role": "user", 
-                        "content": f"Select the most relevant tools for this query:\n{system_prompt}"
-                    }
-                ]
+                "messages": [{"role": "user", "content": f"Select the most relevant tools for this query:\n{prompt}"}]
             })
             return result["responses"][0]
-    else:
-        # Fallback to standard structured output
-        selector_with_structured_output = selector_llm.with_structured_output(
-            ToolSelectionResponse
-        )
-        
-        def _invoke_tool_selector(system_prompt: str) -> ToolSelectionResponse:
-            return selector_with_structured_output.invoke([
-                SystemMessage(content=system_prompt)
-            ])
 
-    def tool_selector(state: State, config: RunnableConfig) -> State:
-        """Select relevant tools based on the user's query."""
+        async def _ainvoke_tool_selector(prompt: str) -> ToolSelectionResponse:
+            # TrustCall doesn't have async invoke yet, run sync in executor
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _invoke_tool_selector, prompt)
+
+    else:
+        selector_with_structured_output = selector_llm.with_structured_output(ToolSelectionResponse)
+        
+        def _invoke_tool_selector(prompt: str) -> ToolSelectionResponse:
+            return selector_with_structured_output.invoke([SystemMessage(content=prompt)])
+
+        async def _ainvoke_tool_selector(prompt: str) -> ToolSelectionResponse:
+            return await selector_with_structured_output.ainvoke([SystemMessage(content=prompt)])
+
+    def tool_selector(state: State, config: RunnableConfig) -> dict:
+        """Selects relevant tools based on the user's query."""
         messages = state["messages"]
         user_query = messages[-1].content if messages else ""
-        
         tool_manifest = _create_tool_manifest(tool_registry)
+        system_prompt = _get_selection_prompt(user_query, tool_manifest)
         
-        system_prompt = f"""You are a tool selection expert. Your task is to analyze a user's query and select the most relevant tools from the available tool registry.
-
-{tool_manifest}
-
-Instructions:
-1. Analyze the user's query carefully
-2. Select 3-10 of the most relevant tools that could help answer the query
-3. Provide the tool IDs (not names) in your response
-4. If no tools are relevant to the query, return an empty list
-5. Explain your reasoning briefly
-
-User Query: {user_query}"""
-
         tool_selection = _invoke_tool_selector(system_prompt)
         
-        # CRITICAL FIX: Append to messages instead of replacing
         return {
             "selected_tool_ids": tool_selection.tool_ids,
             "messages": [
                 AIMessage(
                     content=f"Selected tools: {tool_selection.tool_ids}. Reasoning: {tool_selection.reasoning}"
                 )
-            ]
+            ],
         }
 
-    async def atool_selector(state: State, config: RunnableConfig) -> State:
+    async def atool_selector(state: State, config: RunnableConfig) -> dict:
         """Async version of tool selector."""
         messages = state["messages"]
         user_query = messages[-1].content if messages else ""
-        
         tool_manifest = _create_tool_manifest(tool_registry)
+        system_prompt = _get_selection_prompt(user_query, tool_manifest)
+
+        tool_selection = await _ainvoke_tool_selector(system_prompt)
         
-        system_prompt = f"""You are a tool selection expert. Your task is to analyze a user's query and select the most relevant tools from the available tool registry.
-
-{tool_manifest}
-
-Instructions:
-1. Analyze the user's query carefully
-2. Select 3-10 of the most relevant tools that could help answer the query
-3. Provide the tool IDs (not names) in your response
-4. If no tools are relevant to the query, return an empty list
-5. Explain your reasoning briefly
-
-User Query: {user_query}"""
-
-        if TRUSTCALL_AVAILABLE:
-            # TrustCall doesn't have async invoke yet, so we use sync for now
-            # This can be updated when async support is available
-            tool_selection = _invoke_tool_selector(system_prompt)
-        else:
-            # Use async structured output
-            selector_with_structured_output = selector_llm.with_structured_output(
-                ToolSelectionResponse
-            )
-            tool_selection = await selector_with_structured_output.ainvoke([
-                SystemMessage(content=system_prompt)
-            ])
-        
-        # CRITICAL FIX: Append to messages instead of replacing
         return {
             "selected_tool_ids": tool_selection.tool_ids,
             "messages": [
                 AIMessage(
                     content=f"Selected tools: {tool_selection.tool_ids}. Reasoning: {tool_selection.reasoning}"
                 )
-            ]
+            ],
         }
 
-    def main_agent(state: State, config: RunnableConfig) -> State:
+    def main_agent(state: State, config: RunnableConfig) -> dict:
         """Main agent that uses only the selected tools."""
         selected_tools = [
             tool_registry[tool_id] for tool_id in state["selected_tool_ids"]
@@ -192,12 +169,10 @@ User Query: {user_query}"""
             }
         
         llm_with_tools = main_llm.bind_tools(selected_tools)
-        
-        # CRITICAL FIX: Use entire conversation history instead of string matching
         response = llm_with_tools.invoke(state["messages"])
         return {"messages": [response]}
 
-    async def amain_agent(state: State, config: RunnableConfig) -> State:
+    async def amain_agent(state: State, config: RunnableConfig) -> dict:
         """Async version of main agent."""
         selected_tools = [
             tool_registry[tool_id] for tool_id in state["selected_tool_ids"]
@@ -212,8 +187,6 @@ User Query: {user_query}"""
             }
         
         llm_with_tools = main_llm.bind_tools(selected_tools)
-        
-        # CRITICAL FIX: Use entire conversation history instead of string matching
         response = await llm_with_tools.ainvoke(state["messages"])
         return {"messages": [response]}
 

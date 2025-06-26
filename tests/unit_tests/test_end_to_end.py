@@ -55,6 +55,9 @@ class MockTrustCallExtractor:
 class FakeMainModel(GenericFakeChatModel):
     """Fake model for the main agent."""
     
+    class Config:
+        extra = "allow"
+
     def bind_tools(self, tools) -> "FakeMainModel":
         """Simulate binding tools."""
         self.bound_tools = tools
