@@ -10,6 +10,8 @@ from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.prebuilt import create_react_agent
 
 # Try to import TrustCall, fallback to structured output if not available
 try:
@@ -18,16 +20,17 @@ try:
 except ImportError:
     TRUSTCALL_AVAILABLE = False
 
-
+# Define a utility function to add new items to a list while avoiding duplicates
 def _add_new(left: list, right: list) -> list:
     """Extend left list with new items from right list."""
     return left + [item for item in right if item not in set(left)]
 
 
+# Define the state for the agent, which includes selected tool IDs
 class State(MessagesState):
     selected_tool_ids: Annotated[list[str], _add_new]
 
-
+# Define a structured response model for tool selection
 class ToolSelectionResponse(BaseModel):
     """Structured response for tool selection."""
     tool_ids: List[str] = Field(
@@ -37,12 +40,13 @@ class ToolSelectionResponse(BaseModel):
         description="Brief explanation of why these tools were selected"
     )
 
-
+# Define a function to create an agent with LLM-driven tool selection
 def create_agent(
     selector_llm: LanguageModelLike,
     main_llm: LanguageModelLike,
     tool_registry: dict[str, BaseTool | Callable],
     tool_selection_limit: int = 10,
+    prompt: ChatPromptTemplate | None = None,
 ) -> StateGraph:
     """Create an agent with LLM-driven tool selection.
 
@@ -56,6 +60,35 @@ def create_agent(
         tool_registry: Dict mapping string IDs to tools or callables.
         tool_selection_limit: The maximum number of tools to select.
     """
+    
+    # === 1. DEFINE THE PROMPT FOR THE MAIN AGENT ===
+    # If a custom prompt is not provided, use this robust default.
+    if prompt is None:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """You are a powerful and helpful assistant. Your goal is to use a pre-selected set of tools to answer the user's query accurately.
+
+            **Operational Principles:**
+
+            1.  **Analyze the Goal:** Carefully examine the user's latest query and the conversation history to understand the objective.
+            2.  **Use Your Tools:** You have been provided with a specific, curated set of tools that are deemed relevant for this task. Your primary job is to use them effectively.
+            3.  **ReAct Workflow:** Follow a "Reason-Act" loop to solve the problem:
+                - **Thought:** Explain your reasoning. What are you trying to achieve, and which tool will you use to do it?
+                - **Action:** State the exact tool and input you are using.
+                - **Observation:** After a tool is used, you will see the result.
+                - **Thought:** Analyze the result. Do you have the final answer, or do you need to use another tool? Repeat until you can answer the user's query.
+            4.  **Final Answer:** Once you have sufficient information from your tools, provide a clear, concise, and final answer to the user. Do not explain your internal tool-use process in the final answer.
+            """,
+                            ),
+                            MessagesPlaceholder(variable_name="messages"),
+                            # MessagesPlaceholder(variable_name="agent_scratchpad"),
+                        ]
+                    )
+
+    # === 2. DEFINE THE TOOL SELECTION LOGIC ===
+    # This part remains as it was, responsible for the first node's logic.
     
     def _create_tool_manifest(tool_registry: dict[str, BaseTool | Callable]) -> str:
         """Create a structured manifest of all available tools."""
@@ -98,30 +131,38 @@ User Query: {user_query}"""
             tool_choice="ToolSelectionResponse"
         )
         
-        def _invoke_tool_selector(prompt: str) -> ToolSelectionResponse:
+        def _invoke_tool_selector(sample_prompt: str) -> ToolSelectionResponse:
             result = tool_selector_extractor.invoke({
-                "messages": [{"role": "user", "content": f"Select the most relevant tools for this query:\n{prompt}"}]
+                "messages": [{"role": "user", "content": f"Select the most relevant tools for this query:\n{sample_prompt}"}]
             })
             return result["responses"][0]
 
-        async def _ainvoke_tool_selector(prompt: str) -> ToolSelectionResponse:
+        async def _ainvoke_tool_selector(sample_prompt: str) -> ToolSelectionResponse:
             # TrustCall doesn't have async invoke yet, run sync in executor
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _invoke_tool_selector, prompt)
+            return await loop.run_in_executor(None, _invoke_tool_selector, sample_prompt)
 
     else:
         selector_with_structured_output = selector_llm.with_structured_output(ToolSelectionResponse)
         
-        def _invoke_tool_selector(prompt: str) -> ToolSelectionResponse:
-            return selector_with_structured_output.invoke([SystemMessage(content=prompt)])
+        def _invoke_tool_selector(sample_prompt: str) -> ToolSelectionResponse:
+            return selector_with_structured_output.invoke([SystemMessage(content=sample_prompt)])
 
-        async def _ainvoke_tool_selector(prompt: str) -> ToolSelectionResponse:
-            return await selector_with_structured_output.ainvoke([SystemMessage(content=prompt)])
+        async def _ainvoke_tool_selector(sample_prompt: str) -> ToolSelectionResponse:
+            return await selector_with_structured_output.ainvoke([SystemMessage(content=sample_prompt)])
 
     def tool_selector(state: State, config: RunnableConfig) -> dict:
         """Selects relevant tools based on the user's query."""
         messages = state["messages"]
-        user_query = messages[-1].content if messages else ""
+        # Improved logic to find the last human message
+        user_query = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                # Found the last human message, so we extract its content
+                user_query = message.content
+                break
+        
+        # user_query = messages[-1].content if messages else ""
         tool_manifest = _create_tool_manifest(tool_registry)
         system_prompt = _get_selection_prompt(user_query, tool_manifest)
         
@@ -139,7 +180,13 @@ User Query: {user_query}"""
     async def atool_selector(state: State, config: RunnableConfig) -> dict:
         """Async version of tool selector."""
         messages = state["messages"]
-        user_query = messages[-1].content if messages else ""
+        user_query = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                # Found the last human message, so we extract its content
+                user_query = message.content
+                break
+        # user_query = messages[-1].content if messages else ""
         tool_manifest = _create_tool_manifest(tool_registry)
         system_prompt = _get_selection_prompt(user_query, tool_manifest)
 
@@ -154,73 +201,87 @@ User Query: {user_query}"""
             ],
         }
 
+    # === 3. DEFINE THE MAIN AGENT LOGIC (REWRITTEN) ===
+    # This node is now a true, configurable ReAct agent.
+    
     def main_agent(state: State, config: RunnableConfig) -> dict:
-        """Main agent that uses only the selected tools."""
+        """Main ReAct agent that uses only the selected tools and a dedicated prompt."""
         selected_tools = [
-            tool_registry[tool_id] for tool_id in state["selected_tool_ids"]
+            tool_registry[tool_id] for tool_id in state.get("selected_tool_ids", [])
             if tool_id in tool_registry
         ]
         
-        if not selected_tools:
-            return {
-                "messages": [
-                    AIMessage(content="No valid tools were selected. Please try rephrasing your query.")
-                ]
-            }
+        # Dynamically create the agent with the right tools and prompt
+        agent_executor = create_react_agent(
+            model=main_llm, 
+            tools=selected_tools, 
+            prompt=prompt
+        )
         
-        llm_with_tools = main_llm.bind_tools(selected_tools)
-        response = llm_with_tools.invoke(state["messages"])
-        return {"messages": [response]}
+        # Invoke the agent. It will handle the ReAct loop internally for this one step.
+        response = agent_executor.invoke({"messages": state["messages"]})
+        
+        # Return the message(s) from the agent to be added to the state.
+        # This could be a final answer or a new tool call.
+        return {"messages": response["messages"]}
 
     async def amain_agent(state: State, config: RunnableConfig) -> dict:
-        """Async version of main agent."""
+        """Async version of the main ReAct agent."""
         selected_tools = [
-            tool_registry[tool_id] for tool_id in state["selected_tool_ids"]
+            tool_registry[tool_id] for tool_id in state.get("selected_tool_ids", [])
             if tool_id in tool_registry
         ]
         
-        if not selected_tools:
-            return {
-                "messages": [
-                    AIMessage(content="No valid tools were selected. Please try rephrasing your query.")
-                ]
-            }
+        agent_executor = create_react_agent(
+            model=main_llm, 
+            tools=selected_tools, 
+            prompt=prompt
+        )
         
-        llm_with_tools = main_llm.bind_tools(selected_tools)
-        response = await llm_with_tools.ainvoke(state["messages"])
-        return {"messages": [response]}
+        response = await agent_executor.ainvoke({"messages": state["messages"]})
+        return {"messages": response["messages"]}
 
-    # Create tool node with all tools for execution
-    tool_node = ToolNode([tool for tool in tool_registry.values() if isinstance(tool, BaseTool)])
+    # === 4. DEFINE THE GRAPH STRUCTURE AND FLOW ===
+
+    # The ToolNode is the "hands" that executes tool calls requested by the main agent.
+    # It must be initialized with *all* possible tools from the registry.
+    tool_node = ToolNode(
+        [tool for tool in tool_registry.values() if isinstance(tool, (BaseTool, Callable))]
+    )
 
     def should_continue(state: State) -> str:
-        """Determine if the agent should continue, call tools, or end."""
-        messages = state["messages"]
-        last_message = messages[-1]
+        """Determines if the agent should continue, call tools, or end."""
+        last_message = state["messages"][-1]
         
-        if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-            return END
-        else:
+        # If the agent made a tool call, route to the 'tools' node.
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tools"
+        # Otherwise, the agent has finished, so we end the graph.
+        return END
 
     # Build the graph
     builder = StateGraph(State)
     
-    # Add nodes
+    # Add nodes to the graph
     builder.add_node("tool_selector", tool_selector)
-    builder.add_node("main_agent", main_agent)
-    builder.add_node("tools", tool_node)
+    builder.add_node("main_agent", main_agent) # The new, improved main_agent
+    builder.add_node("tools", tool_node) # The node that executes tool calls
     
-    # Set entry point
+    # Define the graph's flow
     builder.set_entry_point("tool_selector")
-    
-    # Add edges
     builder.add_edge("tool_selector", "main_agent")
+    
+    # This is the agentic loop: main_agent -> should_continue -> (tools or END)
     builder.add_conditional_edges(
         "main_agent",
         should_continue,
-        path_map={"tools": "tools", END: END},
+        {
+            "tools": "tools",
+            END: END,
+        },
     )
+    # After tools are executed, the result is sent back to the main_agent to continue reasoning.
     builder.add_edge("tools", "main_agent")
     
-    return builder
+    # Compile the graph into a runnable object
+    return builder.compile()

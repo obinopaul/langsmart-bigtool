@@ -1,0 +1,438 @@
+# -*- coding: utf-8 -*-
+# https://langchain-ai.github.io/langgraph/how-tos/react-agent-structured-output/
+"""
+LangGraph Agent with Forced Structured Output
+
+This script demonstrates three methods for forcing a tool-calling agent built
+with LangGraph to return its final output in a structured format (e.g., a Pydantic model).
+This is particularly useful for ensuring consistent, machine-readable outputs for
+downstream processing.
+
+The three methods implemented are:
+1.  Option 1: Bind the desired output schema as an additional tool for a single LLM.
+    - Pros: Less expensive, lower latency (one LLM).
+    - Cons: Not guaranteed to work; the LLM might not call the response tool correctly.
+
+2.  Option 2: Use a second LLM to format the final output.
+    - Pros: More reliable and guarantees structured output.
+    - Cons: More expensive, higher latency (two LLM calls).
+    
+3.  Option 3: Use the TrustCall library for resilient extraction.
+    - Pros: Resilient to validation errors, efficient (uses JSON patch), works well for extraction.
+    - Cons: Adds a dependency, slightly different workflow paradigm.
+
+4.  Option 4: Use TrustCall in an agent loop for resilient final extraction.
+    - Pros: Resilient to validation errors, efficient (uses JSON patch), works well for extraction.
+    - Cons: Adds a dependency, combines agentic logic with a final extraction step.
+    
+To run this script, you need to have the following packages installed:
+pip install -U langgraph langchain_anthropic pydantic trustcall
+
+You will also need to set your ANTHROPIC_API_KEY as an environment variable.
+"""
+import getpass
+import os
+from typing import Literal, Optional, List
+from pydantic import BaseModel, Field
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langgraph.graph import StateGraph, END, MessagesState
+from langgraph.prebuilt import ToolNode
+from trustcall import create_extractor
+
+# --- 1. Environment and API Key Setup ---
+def _set_env(var: str):
+    """
+    Set an environment variable if it's not already set.
+    Prompts the user for the value.
+    """
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"Please provide your {var}: ")
+
+_set_env("ANTHROPIC_API_KEY")
+
+# --- 2. Shared Components (State, Tools, Models) ---
+
+# Use Pydantic to define the desired structured output for the weather response.
+# This simple schema is used for Options 1 and 2.
+class WeatherResponse(BaseModel):
+    """The final, structured response for the user."""
+    temperature: float = Field(description="The temperature in fahrenheit")
+    wind_direction: str = Field(description="The direction of the wind in abbreviated form (e.g., 'NE', 'S')")
+    wind_speed: float = Field(description="The speed of the wind in km/h")
+
+    def __str__(self):
+        return f"Temperature: {self.temperature}°F, Wind: {self.wind_speed} km/h from the {self.wind_direction}"
+
+# For Option 3 (TrustCall), we'll use a more complex, nested schema.
+class Location(BaseModel):
+    """Geographical location details."""
+    city: str = Field(description="The city name, e.g., 'San Francisco'")
+    country: str = Field(description="The country, e.g., 'USA'", default="USA")
+
+class WindDetails(BaseModel):
+    """Detailed information about the wind."""
+    speed_mph: float = Field(description="The speed of the wind in miles per hour")
+    direction: str = Field(description="The direction of the wind, e.g., 'North-East'")
+
+class WeatherReport(BaseModel):
+    """A detailed, structured weather report."""
+    location: Location
+    temperature_fahrenheit: int = Field(description="The temperature in fahrenheit")
+    conditions: str = Field(description="The overall weather conditions, e.g., 'cloudy', 'sunny'")
+    wind: WindDetails
+    
+    def __str__(self):
+        return (f"Weather Report for {self.location.city}:\n"
+                f"- Conditions: {self.conditions.capitalize()}\n"
+                f"- Temperature: {self.temperature_fahrenheit}°F\n"
+                f"- Wind: {self.wind.speed_mph} mph from the {self.wind.direction}")
+
+
+# Define the state for our graph. It will contain the history of messages
+# and the final structured response.
+class AgentState(MessagesState):
+    """
+    Represents the state of our agent.
+
+    Attributes:
+        messages: A list of messages in the conversation.
+        final_response: The final structured weather response.
+    """
+    final_response: Optional[WeatherResponse | WeatherReport]
+
+# Define a simple tool for the agent to use.
+@tool
+def get_weather(city: Literal["nyc", "sf"]):
+    """Use this to get weather information for New York City or San Francisco."""
+    if city.lower() == "nyc":
+        return "It is cloudy in NYC, with 5 mph winds in the North-East direction and a temperature of 70 degrees"
+    elif city.lower() == "sf":
+        return "It is 75 degrees and sunny in SF, with 3 mph winds in the South-East direction"
+    else:
+        raise ValueError(f"Unknown city: {city}. Only 'nyc' and 'sf' are supported.")
+
+# Initialize the LLM. We'll use Claude 3 Opus.
+# Using a powerful model is often better for complex agentic behavior.
+model = ChatAnthropic(model="claude-3-opus-20240229")
+
+
+# --- 3. Option 1: Bind Output as a Tool ---
+
+def build_single_llm_graph():
+    """
+    Builds a LangGraph agent that uses a single LLM.
+    The desired output structure (WeatherResponse) is bound as a tool, and the
+    LLM is forced to use a tool on every turn.
+    """
+    print("--- Building Graph for Option 1: Single LLM with Response Tool ---")
+
+    tools_for_option_1 = [get_weather, WeatherResponse]
+    model_with_response_tool = model.bind_tools(tools_for_option_1, tool_choice="any")
+
+    def call_model(state: AgentState):
+        print(" -> Node: agent (calling model)")
+        response = model_with_response_tool.invoke(state["messages"])
+        return {"messages": [response]}
+
+    def respond(state: AgentState):
+        print(" -> Node: respond (formatting final answer)")
+        last_message = state["messages"][-1]
+        weather_tool_call = last_message.tool_calls[0]
+        response = WeatherResponse(**weather_tool_call["args"])
+        tool_message = ToolMessage(
+            content="The user has received the structured weather response.",
+            tool_call_id=weather_tool_call["id"],
+        )
+        return {"final_response": response, "messages": [tool_message]}
+
+    def should_continue(state: AgentState):
+        print(" -> Edge: should_continue?")
+        last_message = state["messages"][-1]
+        if (len(last_message.tool_calls) == 1 and last_message.tool_calls[0]["name"] == "WeatherResponse"):
+            print(" --> Decision: Route to 'respond'")
+            return "respond"
+        else:
+            print(" --> Decision: Route to 'tools' to execute function")
+            return "continue"
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model)
+    workflow.add_node("respond", respond)
+    workflow.add_node("tools", ToolNode(tools_for_option_1))
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {"continue": "tools", "respond": "respond"})
+    workflow.add_edge("tools", "agent")
+    workflow.add_edge("respond", END)
+    
+    return workflow.compile()
+
+
+# --- 4. Option 2: Use a Second LLM for Structuring ---
+
+def build_two_llm_graph():
+    """
+    Builds a LangGraph agent that uses a second LLM to structure the final output.
+    """
+    print("\n--- Building Graph for Option 2: Two LLMs with Structured Output Model ---")
+
+    tools_for_option_2 = [get_weather]
+    model_with_tools = model.bind_tools(tools_for_option_2)
+    model_with_structured_output = model.with_structured_output(WeatherResponse)
+
+    def call_model(state: AgentState):
+        print(" -> Node: agent (calling model)")
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    def respond(state: AgentState):
+        print(" -> Node: respond (calling structuring model)")
+        last_tool_message = state["messages"][-2]
+        response = model_with_structured_output.invoke(
+            [HumanMessage(content=last_tool_message.content)]
+        )
+        return {"final_response": response}
+
+    def should_continue(state: AgentState):
+        print(" -> Edge: should_continue?")
+        last_message = state["messages"][-1]
+        if not last_message.tool_calls:
+            print(" --> Decision: Route to 'respond'")
+            return "respond"
+        else:
+            print(" --> Decision: Route to 'tools' to execute function")
+            return "continue"
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model)
+    workflow.add_node("respond", respond)
+    workflow.add_node("tools", ToolNode(tools_for_option_2))
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {"continue": "tools", "respond": "respond"})
+    workflow.add_edge("tools", "agent")
+    workflow.add_edge("respond", END)
+    
+    return workflow.compile()
+
+# --- 5. Option 3: Use TrustCall for Resilient Extraction ---
+
+def build_trustcall_graph():
+    """
+    Builds a LangGraph agent that uses TrustCall to extract a structured
+    response from a tool's output.
+    """
+    print("\n--- Building Graph for Option 3: TrustCall for Extraction ---")
+    
+    tools_for_option_3 = [get_weather]
+    model_with_tools = model.bind_tools(tools_for_option_3)
+    
+    # Create a TrustCall extractor for our nested WeatherReport schema
+    extractor = create_extractor(
+        model,
+        tools=[WeatherReport],
+        tool_choice="WeatherReport"
+    )
+
+    # Define the nodes for the graph
+    def call_model_agent(state: AgentState):
+        """Invokes the primary agent LLM to decide which tool to use."""
+        print(" -> Node: agent (calling tool-using model)")
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+        
+    def call_extractor(state: AgentState):
+        """Takes raw tool output and uses TrustCall to extract a structured report."""
+        print(" -> Node: extractor (calling TrustCall)")
+        
+        # The last message is the ToolMessage with the raw weather data string
+        last_tool_message = state["messages"][-1]
+        
+        # Create a specific prompt for extraction
+        extraction_prompt = (
+            "Please extract the weather information from the following text "
+            f"and format it as a WeatherReport.\n\nText: '{last_tool_message.content}'"
+        )
+        
+        result = extractor.invoke({
+            "messages": [{"role": "user", "content": extraction_prompt}]
+        })
+        
+        # The response is the first (and only) item in the 'responses' list
+        structured_response = result["responses"][0]
+        
+        return {"final_response": structured_response}
+
+    # Define the routing logic
+    def should_continue(state: AgentState):
+        """Determines whether to call a tool or end."""
+        print(" -> Edge: should_continue?")
+        if state["messages"][-1].tool_calls:
+            print(" --> Decision: Route to 'tools'")
+            return "tools"
+        else:
+            print(" --> Decision: End")
+            return END
+
+    # Assemble the graph
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model_agent)
+    workflow.add_node("tools", ToolNode(tools_for_option_3))
+    workflow.add_node("extractor", call_extractor)
+    
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {END: END, "tools": "tools"})
+    workflow.add_edge("tools", "extractor")
+    workflow.add_edge("extractor", END)
+
+    return workflow.compile()
+
+
+
+# --- 6. Option 4: Agent with TrustCall for Resilient Extraction ---
+
+def build_trustcall_agent_graph():
+    """
+    Builds a LangGraph agent that uses TrustCall to extract a structured
+    response in its final step. This is an agentic version of the TrustCall approach.
+    """
+    print("\n--- Building Graph for Option 3: Agent with TrustCall Extraction ---")
+    
+    tools_for_option_3 = [get_weather]
+    model_with_tools = model.bind_tools(tools_for_option_3)
+    
+    # Create a TrustCall extractor for our nested WeatherReport schema
+    extractor = create_extractor(
+        model,
+        tools=[WeatherReport],
+        tool_choice="WeatherReport"
+    )
+
+    # Define the nodes for the graph
+    def call_model_agent(state: AgentState):
+        """Invokes the primary agent LLM to decide whether to call a tool or finish."""
+        print(" -> Node: agent (calling tool-using model)")
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+        
+    def call_extractor(state: AgentState):
+        """Takes raw tool output from the state and uses TrustCall to extract a structured report."""
+        print(" -> Node: extractor (calling TrustCall)")
+        
+        # Find the last tool message in the state to extract from.
+        last_tool_message = next(m for m in reversed(state['messages']) if isinstance(m, ToolMessage))
+        
+        # Create a specific prompt for extraction
+        extraction_prompt = (
+            "Please extract the weather information from the following text "
+            f"and format it as a WeatherReport.\n\nText: '{last_tool_message.content}'"
+        )
+        
+        result = extractor.invoke({
+            "messages": [{"role": "user", "content": extraction_prompt}]
+        })
+        
+        # The response is the first (and only) item in the 'responses' list
+        structured_response = result["responses"][0]
+        
+        return {"final_response": structured_response}
+
+    # Define the routing logic, same as Option 2
+    def should_continue(state: AgentState):
+        """Determines whether to call a tool or route to the extractor to finish."""
+        print(" -> Edge: should_continue?")
+        last_message = state["messages"][-1]
+        # If the LLM did not call a tool, it must be time to format the answer.
+        if not last_message.tool_calls:
+            print(" --> Decision: Route to 'extractor'")
+            return "extractor"
+        # Otherwise, execute the tool it called.
+        else:
+            print(" --> Decision: Route to 'tools'")
+            return "continue"
+
+    # Assemble the graph
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model_agent)
+    workflow.add_node("tools", ToolNode(tools_for_option_3))
+    workflow.add_node("extractor", call_extractor)
+    
+    workflow.set_entry_point("agent")
+    
+    # The conditional edge now decides between calling a tool or finishing by calling the extractor
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "continue": "tools",
+            "extractor": "extractor",
+        },
+    )
+    workflow.add_edge("tools", "agent")
+    workflow.add_edge("extractor", END)
+
+    return workflow.compile()
+
+# --- 6. Main Execution Block ---
+
+if __name__ == "__main__":
+    # --- Run Option 1 ---
+    graph_1 = build_single_llm_graph()
+    print("\n🚀 Invoking Graph 1...")
+    initial_input_1 = {"messages": [("human", "what is the weather like in san francisco?")]}
+    
+    final_state_1 = graph_1.invoke(initial_input_1)
+    final_answer_1 = final_state_1.get("final_response")
+    
+    print("\n✅ Final Structured Output (Option 1):")
+    if final_answer_1:
+        print(final_answer_1)
+    else:
+        print("No structured response was generated.")
+
+    print("-" * 50)
+
+    # --- Run Option 2 ---
+    graph_2 = build_two_llm_graph()
+    print("\n🚀 Invoking Graph 2...")
+    initial_input_2 = {"messages": [("human", "what is the weather like in nyc?")]}
+
+    final_state_2 = graph_2.invoke(initial_input_2)
+    final_answer_2 = final_state_2.get("final_response")
+    
+    print("\n✅ Final Structured Output (Option 2):")
+    if final_answer_2:
+        print(final_answer_2)
+    else:
+        print("No structured response was generated.")
+
+    print("-" * 50)
+
+    # --- Run Option 3 ---
+    graph_3 = build_trustcall_graph()
+    print("\n🚀 Invoking Graph 3...")
+    initial_input_3 = {"messages": [("human", "Give me a detailed weather report for san francisco")]}
+
+    final_state_3 = graph_3.invoke(initial_input_3)
+    final_answer_3 = final_state_3.get("final_response")
+
+    print("\n✅ Final Structured Output (Option 3 - TrustCall):")
+    if final_answer_3:
+        print(final_answer_3)
+    else:
+        print("No structured response was generated.")
+        
+    # --- Run Option 4 ---
+    graph_4 = build_trustcall_agent_graph()
+    print("\n🚀 Invoking Graph 3...")
+    initial_input_4 = {"messages": [("human", "Give me a detailed weather report for san francisco")]}
+
+    final_state_4 = graph_4.invoke(initial_input_4)
+    final_answer_4 = final_state_4.get("final_response")
+
+    print("\n✅ Final Structured Output (Option 3 - TrustCall Agent):")
+    if final_answer_4:
+        print(final_answer_4)
+    else:
+        print("No structured response was generated.")
