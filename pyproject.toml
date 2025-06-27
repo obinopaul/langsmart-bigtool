@@ -3,15 +3,34 @@ requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
 [project]
-name = "langgraph-bigtool"
-version = "0.0.3"
-description = "Build LangGraph agents with large numbers of tools"
+name = "langsmart-bigtool"
+version = "0.1.0"
+authors = [
+  { name="Paul Okafor", email="acobapaul@gmail.com" },
+]
+description = "A LangGraph agent that uses a two-step process to first select a small subset of tools from a very large collection before executing the user's query."
 readme = "README.md"
 requires-python = ">=3.10"
+license = { file="LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "langgraph>=0.3.0",
     "trustcall>=0.0.39",
+    "langchain-core>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/obinopaul/langsmart-bigtool"
 
 [dependency-groups]
 test = [
